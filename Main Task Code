@@ -1,0 +1,504 @@
+/* Filename: Lab 7 Main Task 7.cpp
+Author: Musa Khizar
+Date: 22/04/2026
+*/
+
+#include "mbed.h"
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+
+using namespace std::chrono;
+
+// --- Serial ---
+static BufferedSerial uart(USBTX, USBRX, 9600);
+
+// --- I2C LCD on PB_9/PB_8 as per hardware doc ---
+I2C i2c(PB_9, PB_8);
+#define LCD_ADDR 0x4E
+
+// --- Keypad ---
+BusOut rows(PB_3, PB_5, PC_7, PA_15);
+DigitalIn col1(PB_12);
+DigitalIn col2(PB_13);
+DigitalIn col3(PB_15);
+DigitalIn col4(PC_6);
+DigitalIn* cols[] = {&col1, &col2, &col3, &col4};
+
+char keys[4][4] = {
+    {'1', '2', '3', 'A'},
+    {'4', '5', '6', 'B'},
+    {'7', '8', '9', 'C'},
+    {'*', '0', '#', 'D'}
+};
+
+// --- 2 Channel Relay - Active LOW ---
+// IN1 controls direction 1 (opening)
+// IN2 controls direction 2 (closing)
+DigitalOut relay1(PF_2);  // IN1 - opening direction
+DigitalOut relay2(PE_3);  // IN2 - closing direction
+
+// --- LEDs ---
+DigitalOut greenLed(D8);  // opening indicator
+DigitalOut redLed(D9);    // closing indicator
+
+// --- Buzzer ---
+DigitalOut buzzer(PE_10);
+
+// --- Interrupt inputs ---
+// Buttons use PullUp + falling edge (active low)
+InterruptIn openBtn(PF_9);   // Dir1 button
+InterruptIn closeBtn(PF_8);  // Dir2 button
+InterruptIn limitSw1(PG_1);  // Dir1 limit switch
+InterruptIn limitSw2(PF_7);  // Dir2 limit switch
+
+// PIR uses rising edge
+InterruptIn pirSensor(PG_0);
+
+// =============================================
+// LCD DRIVER - 20x4
+// =============================================
+
+void lcdWriteByte(uint8_t data) {
+    char buf[1] = {(char)data};
+    i2c.write(LCD_ADDR, buf, 1);
+}
+
+void lcdNibble(uint8_t nibble, bool rs) {
+    uint8_t d = (nibble & 0xF0) | 0x08;
+    if (rs) d |= 0x01;
+    lcdWriteByte(d | 0x04);
+    thread_sleep_for(1);
+    lcdWriteByte(d);
+    thread_sleep_for(1);
+}
+
+void lcdCmd(uint8_t cmd) {
+    lcdNibble(cmd & 0xF0, false);
+    lcdNibble((cmd << 4) & 0xF0, false);
+    thread_sleep_for(2);
+}
+
+void lcdChar(uint8_t data) {
+    lcdNibble(data & 0xF0, true);
+    lcdNibble((data << 4) & 0xF0, true);
+    thread_sleep_for(2);
+}
+
+void lcdInit() {
+    thread_sleep_for(50);
+    lcdNibble(0x30, false); thread_sleep_for(5);
+    lcdNibble(0x30, false); thread_sleep_for(1);
+    lcdNibble(0x30, false); thread_sleep_for(1);
+    lcdNibble(0x20, false); thread_sleep_for(1);
+    lcdCmd(0x28);
+    lcdCmd(0x0C);
+    lcdCmd(0x06);
+    lcdCmd(0x01);
+    thread_sleep_for(5);
+}
+
+void lcdSetCursor(int row, int col) {
+    uint8_t offsets[] = {0x00, 0x40, 0x14, 0x54};
+    lcdCmd(0x80 | (offsets[row] + col));
+}
+
+void lcdPrint(const char* str) {
+    while (*str) lcdChar(*str++);
+}
+
+void lcdRow(int row, const char* msg) {
+    lcdSetCursor(row, 0);
+    char buf[21];
+    snprintf(buf, 21, "%-20s", msg);
+    buf[20] = '\0';
+    lcdPrint(buf);
+}
+
+void lcdClearAll() {
+    lcdCmd(0x01);
+    thread_sleep_for(5);
+}
+
+// =============================================
+// SERIAL
+// =============================================
+
+void sendMsg(const char* m) {
+    uart.write(m, strlen(m));
+}
+
+// =============================================
+// SYSTEM STATE
+// =============================================
+
+typedef enum {
+    MOTOR_IDLE,
+    MOTOR_OPENING,
+    MOTOR_CLOSING
+} MotorState;
+
+MotorState motorState    = MOTOR_IDLE;
+bool       alarmActive   = false;
+bool       pirTriggered  = false;
+bool       openPressed   = false;
+bool       closePressed  = false;
+bool       limit1Hit     = false;
+bool       limit2Hit     = false;
+
+int pirCount    = 0;
+int openCount   = 0;
+int closeCount  = 0;
+int limitCount  = 0;
+
+Timer motorTimer;
+Timer updateTimer;
+Timer lcdTimer;
+
+// =============================================
+// INTERRUPT SERVICE ROUTINES
+// =============================================
+
+void pirISR() {
+    pirTriggered = true;
+    pirCount++;
+}
+
+void openISR() {
+    openPressed = true;
+    openCount++;
+}
+
+void closeISR() {
+    closePressed = true;
+    closeCount++;
+}
+
+void limit1ISR() {
+    limit1Hit = true;
+    limitCount++;
+}
+
+void limit2ISR() {
+    limit2Hit = true;
+    limitCount++;
+}
+
+// =============================================
+// MOTOR CONTROL
+// Active-low relay: 0 = relay ON, 1 = relay OFF
+// =============================================
+
+void motorStop() {
+    // Both relays OFF (active low so set to 1)
+    relay1     = 1;
+    relay2     = 1;
+    greenLed   = 0;
+    redLed     = 0;
+    motorState = MOTOR_IDLE;
+    motorTimer.stop();
+    sendMsg(">> Motor: Stopped\r\n");
+}
+
+void motorOpen() {
+    // Relay1 ON, Relay2 OFF
+    // Active low: relay1=0 means ON
+    relay1     = 0;
+    relay2     = 1;
+    greenLed   = 1;
+    redLed     = 0;
+    motorState = MOTOR_OPENING;
+    motorTimer.reset();
+    motorTimer.start();
+    sendMsg(">> Motor: Opening gate\r\n");
+    lcdClearAll();
+    lcdRow(0, "Gate Status:");
+    lcdRow(1, ">> OPENING...");
+    lcdRow(2, "Green LED ON");
+    lcdRow(3, "Motor running");
+}
+
+void motorClose() {
+    // Relay1 OFF, Relay2 ON
+    relay1     = 1;
+    relay2     = 0;
+    greenLed   = 0;
+    redLed     = 1;
+    motorState = MOTOR_CLOSING;
+    motorTimer.reset();
+    motorTimer.start();
+    sendMsg(">> Motor: Closing gate\r\n");
+    lcdClearAll();
+    lcdRow(0, "Gate Status:");
+    lcdRow(1, ">> CLOSING...");
+    lcdRow(2, "Red LED ON");
+    lcdRow(3, "Motor running");
+}
+
+// =============================================
+// KEYPAD
+// =============================================
+
+char getKey() {
+    col1.mode(PullUp);
+    col2.mode(PullUp);
+    col3.mode(PullUp);
+    col4.mode(PullUp);
+
+    for (int r = 0; r < 4; r++) {
+        rows = (0xF & ~(1 << r));
+        thread_sleep_for(5);
+        for (int c = 0; c < 4; c++) {
+            if (cols[c]->read() == 0) {
+                thread_sleep_for(20);
+                if (cols[c]->read() == 0) {
+                    while (cols[c]->read() == 0);
+                    thread_sleep_for(20);
+                    return keys[r][c];
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// =============================================
+// MAIN
+// =============================================
+
+int main()
+{
+    // --- Initialise relays OFF (active low = 1) ---
+    relay1   = 1;
+    relay2   = 1;
+    greenLed = 0;
+    redLed   = 0;
+    buzzer   = 0;
+
+    // --- Attach interrupts ---
+    // Buttons: PullUp + falling edge (pressed = LOW)
+    openBtn.mode(PullUp);
+    closeBtn.mode(PullUp);
+    limitSw1.mode(PullUp);
+    limitSw2.mode(PullUp);
+
+    openBtn.fall(&openISR);
+    closeBtn.fall(&closeISR);
+    limitSw1.fall(&limit1ISR);
+    limitSw2.fall(&limit2ISR);
+
+    // PIR: rising edge (motion = HIGH)
+    pirSensor.rise(&pirISR);
+
+    // --- Start timers ---
+    updateTimer.start();
+    lcdTimer.start();
+
+    // --- Serial startup ---
+    thread_sleep_for(2000);
+    sendMsg("\r\n=== Smart Home Motor Lab 7 ===\r\n");
+    sendMsg("Keypad: 1=Open  2=Close  3=Stop\r\n");
+    sendMsg("        4=Status 5=Alarm  #=Log\r\n");
+    sendMsg("==============================\r\n\n");
+
+    // --- LCD init ---
+    i2c.frequency(100000);
+    lcdInit();
+    lcdClearAll();
+    lcdRow(0, "Smart Home Lab 7");
+    lcdRow(1, "Motor Control");
+    lcdRow(2, "System Ready");
+    lcdRow(3, "Awaiting input...");
+
+    thread_sleep_for(3000);
+    lcdClearAll();
+    lcdRow(0, "Smart Home Lab 7");
+    lcdRow(1, "Motor: IDLE");
+    lcdRow(2, "Alarm: OFF");
+    lcdRow(3, "Press 1=Open 2=Close");
+
+    while (true) {
+
+        // --- PIR interrupt ---
+        if (pirTriggered) {
+            pirTriggered = false;
+            alarmActive  = true;
+            buzzer       = 1;
+            sendMsg("!! INTERRUPT: PIR - Intruder!\r\n");
+            lcdClearAll();
+            lcdRow(0, "!! INTRUDER !!");
+            lcdRow(1, "PIR sensor triggered");
+            lcdRow(2, "Buzzer active");
+            lcdRow(3, "Press 5 to clear");
+        }
+
+        // --- Open button interrupt ---
+        if (openPressed) {
+            openPressed = false;
+            if (motorState != MOTOR_OPENING) {
+                sendMsg("!! INTERRUPT: Open button\r\n");
+                motorOpen();
+            }
+        }
+
+        // --- Close button interrupt ---
+        if (closePressed) {
+            closePressed = false;
+            if (motorState != MOTOR_CLOSING) {
+                sendMsg("!! INTERRUPT: Close button\r\n");
+                motorClose();
+            }
+        }
+
+        // --- Limit switch 1 hit (gate fully open) ---
+        if (limit1Hit) {
+            limit1Hit = false;
+            sendMsg("!! INTERRUPT: Limit SW1 - Gate open!\r\n");
+            motorStop();
+            lcdClearAll();
+            lcdRow(0, "Gate fully OPEN");
+            lcdRow(1, "Limit switch 1 hit");
+            lcdRow(2, "Motor stopped");
+            lcdRow(3, "");
+        }
+
+        // --- Limit switch 2 hit (gate fully closed) ---
+        if (limit2Hit) {
+            limit2Hit = false;
+            sendMsg("!! INTERRUPT: Limit SW2 - Gate closed!\r\n");
+            motorStop();
+            lcdClearAll();
+            lcdRow(0, "Gate fully CLOSED");
+            lcdRow(1, "Limit switch 2 hit");
+            lcdRow(2, "Motor stopped");
+            lcdRow(3, "");
+        }
+
+        // --- Auto stop after 3 seconds ---
+        if (motorState != MOTOR_IDLE &&
+            motorTimer.elapsed_time() > seconds(3)) {
+            motorStop();
+            sendMsg(">> Motor auto-stopped 3s\r\n");
+            lcdClearAll();
+            lcdRow(0, "Gate Status:");
+            lcdRow(1, "Auto stop 3s");
+            lcdRow(2, "Motor idle");
+            lcdRow(3, "");
+        }
+
+        // --- Serial status every 2 seconds ---
+        if (updateTimer.elapsed_time() > seconds(2)) {
+            updateTimer.reset();
+            const char* mState =
+                motorState == MOTOR_OPENING ? "OPENING" :
+                motorState == MOTOR_CLOSING ? "CLOSING" : "IDLE";
+            char buf[150];
+            snprintf(buf, 150,
+                "-- System Status --\r\n"
+                "   Motor      : %s\r\n"
+                "   Alarm      : %s\r\n"
+                "   PIR count  : %d\r\n"
+                "   Open count : %d\r\n"
+                "   Close count: %d\r\n"
+                "   Limit hits : %d\r\n"
+                "-------------------\r\n",
+                mState,
+                alarmActive ? "ACTIVE" : "OFF",
+                pirCount, openCount,
+                closeCount, limitCount);
+            sendMsg(buf);
+        }
+
+        // --- LCD idle update every 5 seconds ---
+        if (motorState == MOTOR_IDLE && !alarmActive &&
+            lcdTimer.elapsed_time() > seconds(5)) {
+            lcdTimer.reset();
+            char lbuf[21];
+            lcdRow(0, "Smart Home Lab 7");
+            lcdRow(1, "Motor: IDLE");
+            snprintf(lbuf, 21, "Alarm: %s",
+                alarmActive ? "ACTIVE" : "OFF");
+            lcdRow(2, lbuf);
+            snprintf(lbuf, 21, "PIR hits: %d", pirCount);
+            lcdRow(3, lbuf);
+        }
+
+        // --- Keypad ---
+        char k = getKey();
+        if (k != 0) {
+
+            if (k == '1') {
+                sendMsg(">> Keypad: Manual open\r\n");
+                motorOpen();
+
+            } else if (k == '2') {
+                sendMsg(">> Keypad: Manual close\r\n");
+                motorClose();
+
+            } else if (k == '3') {
+                sendMsg(">> Keypad: Stop motor\r\n");
+                motorStop();
+                lcdClearAll();
+                lcdRow(0, "Motor stopped");
+                lcdRow(1, "Manual stop key 3");
+                lcdRow(2, "");
+                lcdRow(3, "");
+
+            } else if (k == '4') {
+                const char* mState =
+                    motorState == MOTOR_OPENING ? "OPENING" :
+                    motorState == MOTOR_CLOSING ? "CLOSING" : "IDLE";
+                char buf[21];
+                snprintf(buf, 21, "Motor: %s", mState);
+                lcdRow(0, buf);
+                snprintf(buf, 21, "Relay1:%s Relay2:%s",
+                    relay1.read() == 0 ? "ON" : "OFF",
+                    relay2.read() == 0 ? "ON" : "OFF");
+                lcdRow(1, buf);
+                snprintf(buf, 21, "Green:%s Red:%s",
+                    greenLed.read() ? "ON" : "OFF",
+                    redLed.read()   ? "ON" : "OFF");
+                lcdRow(2, buf);
+                snprintf(buf, 21, "PIR:%d Lim:%d",
+                    pirCount, limitCount);
+                lcdRow(3, buf);
+                sendMsg(">> Keypad: Status on LCD\r\n");
+
+            } else if (k == '5') {
+                alarmActive = false;
+                buzzer      = 0;
+                sendMsg(">> Keypad: Alarm cleared\r\n");
+                lcdClearAll();
+                lcdRow(0, "Alarm Cleared");
+                lcdRow(1, "Buzzer OFF");
+                lcdRow(2, "System Normal");
+                lcdRow(3, "");
+
+            } else if (k == '#') {
+                char buf[150];
+                snprintf(buf, 150,
+                    "-- Interrupt Log --\r\n"
+                    "   PIR triggers : %d\r\n"
+                    "   Open presses : %d\r\n"
+                    "   Close presses: %d\r\n"
+                    "   Limit hits   : %d\r\n"
+                    "-------------------\r\n",
+                    pirCount, openCount,
+                    closeCount, limitCount);
+                sendMsg(buf);
+                char lbuf[21];
+                lcdClearAll();
+                lcdRow(0, "Interrupt Log:");
+                snprintf(lbuf, 21, "PIR: %d", pirCount);
+                lcdRow(1, lbuf);
+                snprintf(lbuf, 21, "Open: %d Close: %d",
+                    openCount, closeCount);
+                lcdRow(2, lbuf);
+                snprintf(lbuf, 21, "Limit hits: %d", limitCount);
+                lcdRow(3, lbuf);
+            }
+        }
+
+        thread_sleep_for(10);
+    }
+}
